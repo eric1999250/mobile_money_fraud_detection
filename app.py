@@ -912,6 +912,32 @@ def transfer():
         except (TypeError, ValueError):
             return _err("Invalid amount.")
 
+        # ── Face is MANDATORY for every transaction ───────────────────────
+        if not face_b64:
+            return _ok({
+                "success"      : False,
+                "face_required": True,
+                "action"       : "REQUIRE_FACE",
+                "message"      : "Face verification is required for every transaction. Please scan your face to proceed."
+            })
+
+        # ── Verify sender face BEFORE processing transfer ─────────────────
+        user = auth_system.validate_session(token)
+        if not user:
+            return _err("Invalid or expired session.", 401)
+
+        face_check = user_reg.verify_face_from_base64(user["phone"], face_b64, tolerance=0.55)
+        if not face_check.get("verified"):
+            err_msg = face_check.get("error", "Face verification failed.")
+            _log_access("TRANSFER_FACE_FAIL", user.get("phone",""), user.get("name",""),
+                        "user", "FAILED", err_msg[:200])
+            return _ok({
+                "success"      : False,
+                "face_required": True,
+                "action"       : "FACE_FAILED",
+                "message"      : f"Face verification failed: {err_msg} Transaction blocked."
+            })
+
         result = transfer_system.initiate_transfer(
             session_token   = token,
             recipient_phone = recipient_phone,
@@ -919,6 +945,11 @@ def transfer():
             transfer_type   = transfer_type,
             face_base64     = face_b64,
         )
+
+        # Abroad pending — not a failure, just pending owner approval
+        if result.get("action") == "ABROAD_PENDING":
+            return _ok(result)
+
         code = 200 if result.get("success") or result.get("face_required") else 400
         return _ok(result, code)
 
@@ -1036,8 +1067,162 @@ def travel_status(phone):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN / DASHBOARD ROUTES
+# ABROAD TRANSFER VERIFICATION  (owner approves pending transfer via email link)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/abroad-verify/info", methods=["GET"])
+def abroad_verify_info():
+    """
+    Return details of a pending abroad transfer by token.
+    Called when the abroad owner opens the verification link.
+    """
+    try:
+        token = request.args.get("token", "").strip()
+        if not token:
+            return _err("Token is required.")
+
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT apt.id, apt.recipient_phone, apt.amount, apt.fee,
+                   apt.destination, apt.expires_at, apt.status,
+                   u.full_name, u.email, u.phone_number
+            FROM abroad_pending_transfers apt
+            JOIN users u ON apt.sender_id = u.id
+            WHERE apt.verify_token = %s
+        ''', (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row:
+            return _err("Invalid or expired verification link.", 404)
+
+        pid, recipient_phone, amount, fee, destination, expires_at, status, \
+            owner_name, owner_email, owner_phone = row
+
+        from datetime import datetime as _dt
+        if status != 'pending':
+            return _ok({
+                "success": False,
+                "status": status,
+                "message": f"This transfer has already been {status}."
+            })
+        if _dt.now() > expires_at:
+            return _ok({
+                "success": False,
+                "status": "expired",
+                "message": "This verification link has expired."
+            })
+
+        return _ok({
+            "success"        : True,
+            "token"          : token,
+            "owner_name"     : owner_name,
+            "owner_phone"    : owner_phone,
+            "recipient_phone": recipient_phone,
+            "amount"         : amount,
+            "fee"            : fee,
+            "total"          : amount + fee,
+            "destination"    : destination,
+            "expires_at"     : expires_at.isoformat() if expires_at else None,
+        })
+    except Exception as e:
+        return _err(f"Abroad verify info failed: {e}", 500)
+
+
+@app.route("/api/abroad-verify/confirm", methods=["POST"])
+def abroad_verify_confirm():
+    """
+    Abroad owner scans face to approve the pending transfer.
+    Steps:
+      1. Validate token → load pending transfer
+      2. Verify face against owner's stored encoding
+      3. On match → complete the transfer
+      4. On fail  → block the transfer, raise fraud alert
+    """
+    try:
+        data     = request.get_json() or {}
+        token    = data.get("token", "").strip()
+        face_b64 = data.get("face_base64", "")
+
+        if not token:
+            return _err("Token is required.")
+        if not face_b64:
+            return _err("Face scan is required to approve this transfer.")
+
+        # Load the pending transfer
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT apt.id, apt.recipient_phone, apt.amount, apt.fee,
+                   apt.destination, apt.expires_at, apt.status,
+                   u.id as sender_id, u.full_name, u.phone_number, u.email
+            FROM abroad_pending_transfers apt
+            JOIN users u ON apt.sender_id = u.id
+            WHERE apt.verify_token = %s
+        ''', (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row:
+            return _err("Invalid or expired verification link.", 404)
+
+        pid, recipient_phone, amount, fee, destination, expires_at, status, \
+            sender_id, owner_name, owner_phone, owner_email = row
+
+        from datetime import datetime as _dt
+        if status != 'pending':
+            return _ok({"success": False, "status": status,
+                        "message": f"This transfer has already been {status}."})
+        if _dt.now() > expires_at:
+            return _ok({"success": False, "status": "expired",
+                        "message": "This verification link has expired."})
+
+        # Verify face against owner's stored encoding
+        face_result = user_reg.verify_face_from_base64(owner_phone, face_b64, tolerance=0.55)
+
+        if not face_result.get("verified"):
+            # Face failed — block the transfer, raise alert
+            conn2 = get_db_connection()
+            c2 = conn2.cursor()
+            c2.execute("UPDATE abroad_pending_transfers SET status='blocked' WHERE id=%s", (pid,))
+            conn2.commit(); conn2.close()
+
+            try:
+                fraud_detector.alert_sys.raise_alert(
+                    owner_phone, amount, 0.95, "HIGH", "BLOCK",
+                    f"Abroad transfer face verification FAILED — transfer blocked. "
+                    f"Recipient: {recipient_phone}, Amount: {amount:,.0f} RWF, "
+                    f"Destination: {destination}. Owner face did not match."
+                )
+            except Exception:
+                pass
+
+            _log_access("ABROAD_VERIFY_FAIL", owner_phone, owner_name,
+                        "user", "FAILED",
+                        face_result.get("error", "Face mismatch")[:200])
+
+            return _ok({
+                "success": False,
+                "action" : "BLOCKED",
+                "message": (
+                    f"Face verification failed. Transfer has been BLOCKED. "
+                    f"If this was you, please contact support. "
+                    f"Error: {face_result.get('error', 'Face did not match')}"
+                )
+            })
+
+        # Face matched — complete the transfer
+        result = transfer_system.complete_abroad_transfer(token)
+
+        if result["success"]:
+            _log_access("ABROAD_VERIFY_OK", owner_phone, owner_name,
+                        "user", "SUCCESS",
+                        f"Abroad face-verified transfer approved: {amount:,.0f} RWF → {recipient_phone}")
+        return _ok(result)
+
+    except Exception as e:
+        return _err(f"Abroad verification failed: {e}", 500)
 
 @app.route("/api/dashboard/stats", methods=["GET"])
 def dashboard_stats():

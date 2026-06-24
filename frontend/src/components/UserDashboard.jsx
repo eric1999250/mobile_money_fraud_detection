@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Wallet, Send, History, Lock, User, Camera, Check, RefreshCw, LogOut, AlertTriangle, Shield, Activity } from 'lucide-react';
+import { Wallet, Send, History, Lock, User, Camera, Check, RefreshCw, LogOut, AlertTriangle, Shield, Activity, Plane } from 'lucide-react';
 import { fmtRWF, fmtDate, showAlert, setLoading } from '../utils/helpers';
 
 const API = 'http://localhost:5000';
@@ -72,6 +72,15 @@ export default function UserDashboard() {
   const [showSetPinModal, setShowSetPinModal] = useState(false);
   const [newPinInput, setNewPinInput] = useState('');
   const [newPinMsg, setNewPinMsg] = useState({ show: false, message: '' });
+
+  // Transfer face-capture state
+  const [transferStep, setTransferStep] = useState('form');   // form | face | processing
+  const [transferFaceBase64, setTransferFaceBase64] = useState(null);
+  const [transferFaceCaptured, setTransferFaceCaptured] = useState(false);
+  const [transferFaceStream, setTransferFaceStream] = useState(null);
+  const [transferFaceMsg, setTransferFaceMsg] = useState('');
+  const transferVideoRef = useRef(null);
+  const transferCanvasRef = useRef(null);
   
   // Reset PIN state
   const [resetStep, setResetStep] = useState(1);
@@ -123,8 +132,9 @@ export default function UserDashboard() {
     return () => {
       if (resetStream) resetStream.getTracks().forEach(t => t.stop());
       if (updateStream) updateStream.getTracks().forEach(t => t.stop());
+      if (transferFaceStream) transferFaceStream.getTracks().forEach(t => t.stop());
     };
-  }, [resetStream, updateStream]);
+  }, [resetStream, updateStream, transferFaceStream]);
   
   const init = async () => {
     try {
@@ -234,6 +244,66 @@ export default function UserDashboard() {
     setFee(calculatedFee);
   };
   
+  // ── Transfer face capture helpers ────────────────────────────────────
+
+  const startTransferCamera = async () => {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
+      });
+      setTransferFaceStream(s);
+      setTransferFaceCaptured(false);
+      setTransferFaceBase64(null);
+      setTransferFaceMsg('');
+      if (transferVideoRef.current) {
+        transferVideoRef.current.srcObject = s;
+        transferVideoRef.current.style.transform = 'scaleX(-1)';
+      }
+    } catch (e) {
+      setTransferFaceMsg('Camera access denied. Please allow camera access.');
+    }
+  };
+
+  const captureTransferFace = () => {
+    const video  = transferVideoRef.current;
+    const canvas = transferCanvasRef.current;
+    if (!video || !canvas) return;
+
+    canvas.width  = video.videoWidth  || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext('2d');
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    // Brightness check
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let total = 0;
+    for (let i = 0; i < data.length; i += 4)
+      total += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    const avg = total / (data.length / 4);
+    if (avg < 35) { setTransferFaceMsg('⚠️ Too dark — move to a brighter area.'); return; }
+    if (avg > 240) { setTransferFaceMsg('⚠️ Too bright — reduce glare.'); return; }
+
+    setTransferFaceMsg('');
+    const scaled = document.createElement('canvas');
+    scaled.width  = 480;
+    scaled.height = Math.round(canvas.height * 480 / canvas.width);
+    scaled.getContext('2d').drawImage(canvas, 0, 0, scaled.width, scaled.height);
+    const base64 = scaled.toDataURL('image/jpeg', 0.85).split(',')[1];
+
+    setTransferFaceBase64(base64);
+    setTransferFaceCaptured(true);
+    if (transferFaceStream) { transferFaceStream.getTracks().forEach(t => t.stop()); setTransferFaceStream(null); }
+  };
+
+  const retakeTransferFace = () => {
+    setTransferFaceBase64(null);
+    setTransferFaceCaptured(false);
+    startTransferCamera();
+  };
+
   const doTransfer = async () => {
     if (!recipientPhone || !transferAmount) {
       showAlert(setTransferMsg, 'Please fill in all fields', 'error');
@@ -264,6 +334,24 @@ export default function UserDashboard() {
         return;
       }
 
+      // PIN ok — move to face scan step
+      setShowPinModal(false);
+      setTransferStep('face');
+      // Start camera automatically
+      setTimeout(() => startTransferCamera(), 300);
+
+    } catch (e) {
+      setPinModalMsg({ show: true, message: 'Network error. Please try again.' });
+    }
+  };
+
+  const submitTransferWithFace = async () => {
+    if (!transferFaceBase64) {
+      setTransferFaceMsg('Please capture your face first.');
+      return;
+    }
+    setTransferStep('processing');
+    try {
       const r = await fetch(`http://localhost:5000/api/transfer`, {
         method: 'POST',
         headers: {
@@ -274,24 +362,32 @@ export default function UserDashboard() {
           session_token: TOKEN(),
           recipient_phone: '+250' + recipientPhone,
           amount: parseFloat(transferAmount),
-          pin: pinInput
+          face_base64: transferFaceBase64
         })
       });
       const d = await r.json();
-      if (d.success) {
-        showAlert(setTransferMsg, 'Transfer successful!', 'success');
-        setShowPinModal(false);
-        setPinInput('');
+
+      setTransferStep('form');
+
+      if (d.action === 'ABROAD_PENDING' || d.abroad_pending) {
+        showAlert(setTransferMsg, d.message || 'Transfer pending owner approval.', 'info');
+      } else if (d.success) {
+        showAlert(setTransferMsg, 'Transfer successful! ✅', 'success');
         setRecipientPhone('');
         setRecipientName('');
         setTransferAmount('');
         setFee(0);
         loadBalance();
       } else {
-        setPinModalMsg({ show: true, message: d.error || 'Transfer failed' });
+        showAlert(setTransferMsg, d.message || d.error || 'Transfer failed', 'error');
       }
+      // Reset face state
+      setTransferFaceBase64(null);
+      setTransferFaceCaptured(false);
+      setPinInput('');
     } catch (e) {
-      setPinModalMsg({ show: true, message: 'Network error. Please try again.' });
+      setTransferStep('form');
+      showAlert(setTransferMsg, 'Network error. Please try again.', 'error');
     }
   };
   
@@ -708,6 +804,9 @@ export default function UserDashboard() {
             </div>
             
             <div className="max-w-[480px] mx-auto">
+
+              {/* ── Step 1: Transfer Form ── */}
+              {transferStep === 'form' && (
               <Card>
                 <div className="p-6 border-b border-slate-300 flex flex-col items-center text-center">
                   <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-500 to-sky-500 flex items-center justify-center mb-2.5">
@@ -774,6 +873,12 @@ export default function UserDashboard() {
                       </div>
                     </div>
                   )}
+
+                  {/* Security note */}
+                  <div className="mb-4 flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-xs text-emerald-700">
+                    <Shield className="w-4 h-4 flex-shrink-0" />
+                    Face verification required for every transfer
+                  </div>
                   
                   <Button onClick={doTransfer} className="w-full justify-center">
                     <Send className="w-4 h-4" />
@@ -781,6 +886,109 @@ export default function UserDashboard() {
                   </Button>
                 </div>
               </Card>
+              )}
+
+              {/* ── Step 2: Face Scan ── */}
+              {transferStep === 'face' && (
+              <Card>
+                <div className="p-6 border-b border-slate-300 flex flex-col items-center text-center">
+                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-500 to-sky-500 flex items-center justify-center mb-2.5">
+                    <Camera className="w-5 h-5 text-white" />
+                  </div>
+                  <h2 className="text-base font-semibold">Face Verification</h2>
+                  <p className="text-xs text-slate-500 mt-1">Required for every transaction — confirm it's you</p>
+                </div>
+                <div className="p-6">
+                  {/* Transfer summary */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 mb-4 text-xs">
+                    <div className="flex justify-between mb-1">
+                      <span className="text-slate-500">To</span>
+                      <span className="font-mono font-semibold">+250{recipientPhone}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Total</span>
+                      <span className="font-bold text-emerald-600">{fmtRWF((parseFloat(transferAmount)||0) + fee)}</span>
+                    </div>
+                  </div>
+
+                  {transferFaceMsg && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-700 mb-3 flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                      {transferFaceMsg}
+                    </div>
+                  )}
+
+                  {/* Camera area */}
+                  <div className="rounded-xl overflow-hidden border-2 border-slate-300 mb-4 bg-black relative">
+                    <video
+                      ref={transferVideoRef}
+                      autoPlay muted playsInline
+                      className={`w-full ${transferFaceCaptured ? 'hidden' : 'block'}`}
+                    />
+                    {transferFaceCaptured && transferFaceBase64 && (
+                      <img src={`data:image/jpeg;base64,${transferFaceBase64}`}
+                           alt="Captured" className="w-full" />
+                    )}
+                    {!transferFaceCaptured && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <div className="w-36 h-44 border-2 border-emerald-400 border-dashed rounded-full opacity-50" />
+                      </div>
+                    )}
+                    {!transferFaceStream && !transferFaceCaptured && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 gap-2">
+                        <Camera className="w-8 h-8 opacity-40" />
+                        <span className="text-xs">Camera preview</span>
+                      </div>
+                    )}
+                  </div>
+                  <canvas ref={transferCanvasRef} className="hidden" />
+
+                  {!transferFaceStream && !transferFaceCaptured && (
+                    <button onClick={startTransferCamera}
+                      className="w-full py-3 bg-gradient-to-br from-emerald-500 to-sky-500 text-white rounded-[14px] font-bold text-sm flex items-center justify-center gap-2 hover:shadow-lg transition-all mb-2">
+                      <Camera className="w-4 h-4" /> Open Camera
+                    </button>
+                  )}
+
+                  {transferFaceStream && !transferFaceCaptured && (
+                    <button onClick={captureTransferFace}
+                      className="w-full py-3 bg-gradient-to-br from-emerald-500 to-sky-500 text-white rounded-[14px] font-bold text-sm flex items-center justify-center gap-2 hover:shadow-lg transition-all mb-2">
+                      <Camera className="w-4 h-4" /> Capture
+                    </button>
+                  )}
+
+                  {transferFaceCaptured && (
+                    <div className="space-y-2">
+                      <button onClick={submitTransferWithFace}
+                        className="w-full py-3 bg-gradient-to-br from-emerald-500 to-sky-500 text-white rounded-[14px] font-bold text-sm flex items-center justify-center gap-2 hover:shadow-lg transition-all">
+                        <Check className="w-4 h-4" /> Confirm & Send
+                      </button>
+                      <button onClick={retakeTransferFace}
+                        className="w-full py-2.5 bg-transparent text-emerald-600 border border-emerald-500 rounded-[14px] font-semibold text-sm flex items-center justify-center gap-2 hover:bg-emerald-50 transition-all">
+                        <RefreshCw className="w-4 h-4" /> Retake
+                      </button>
+                    </div>
+                  )}
+
+                  <button onClick={() => { setTransferStep('form'); if(transferFaceStream) transferFaceStream.getTracks().forEach(t=>t.stop()); setTransferFaceStream(null); setTransferFaceCaptured(false); setTransferFaceBase64(null); }}
+                    className="w-full mt-2 py-2 bg-transparent text-slate-500 text-xs hover:text-slate-700 transition-all">
+                    ← Cancel
+                  </button>
+                </div>
+              </Card>
+              )}
+
+              {/* ── Step 3: Processing ── */}
+              {transferStep === 'processing' && (
+              <Card>
+                <div className="p-16 text-center">
+                  <div className="w-12 h-12 border-3 border-emerald-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+                  <p className="text-sm font-semibold text-slate-700">Verifying face &amp; processing transfer…</p>
+                  <p className="text-xs text-slate-400 mt-1">Please wait</p>
+                </div>
+              </Card>
+              )}
+
             </div>
           </div>
         )}

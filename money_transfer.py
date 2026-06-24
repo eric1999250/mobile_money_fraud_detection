@@ -30,6 +30,7 @@ class MoneyTransferSystem:
         self.auth       = AuthenticationSystem(db_config)
         self.fraud_det  = RealTimeFraudDetector(db_config)
         self._init_tables()
+        self._init_abroad_pending_table()
         self._init_balance_attempt_table()
     
     def get_connection(self):
@@ -111,6 +112,30 @@ class MoneyTransferSystem:
     # ─────────────────────────────────────────────────────────────────────
     # OVER-BALANCE ATTEMPT TRACKING
     # ─────────────────────────────────────────────────────────────────────
+
+    def _init_abroad_pending_table(self):
+        """Table for transfers that need abroad-owner face verification via email link."""
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS abroad_pending_transfers (
+                id               SERIAL PRIMARY KEY,
+                sender_id        INTEGER NOT NULL,
+                recipient_phone  TEXT    NOT NULL,
+                amount           REAL    NOT NULL,
+                fee              REAL    DEFAULT 0.0,
+                transfer_type    TEXT    NOT NULL,
+                network          TEXT    NOT NULL,
+                verify_token     TEXT    UNIQUE NOT NULL,
+                status           TEXT    DEFAULT 'pending',
+                destination      TEXT,
+                expires_at       TIMESTAMP NOT NULL,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (sender_id) REFERENCES users (id)
+            )
+        ''')
+        conn.commit()
+        conn.close()
 
     def _init_balance_attempt_table(self):
         """
@@ -246,7 +271,7 @@ class MoneyTransferSystem:
             return {"success": False,
                     "error": "Session expired. Please log in again."}
 
-        # ── 1b. Travel / SIM block check (sender) ────────────────────────
+        # ── 1b. Travel check (sender) — ALLOW but require owner email-face verify ──
         try:
             conn = self.get_connection()
             c = conn.cursor()
@@ -256,21 +281,17 @@ class MoneyTransferSystem:
                 WHERE user_phone = %s
                   AND date(departure_date) <= date(%s)
                   AND date(return_date)    >= date(%s)
+                  AND sim_deactivated = TRUE
                 ORDER BY id DESC LIMIT 1
             ''', (user["phone"], today, today))
             travel_row = c.fetchone()
             conn.close()
             if travel_row:
-                return {
-                    "success": False,
-                    "action": "BLOCK",
-                    "error": (
-                        f"✈️ Your SIM is blocked while you are abroad in "
-                        f"{travel_row[0]}. Transfers are disabled until your "
-                        f"return on {travel_row[1]}. "
-                        f"Contact your service provider if you are already back."
-                    )
-                }
+                # Sender is abroad — save as pending and email the owner for face verify
+                return self._handle_abroad_transfer(
+                    user, recipient_phone, amount, fee, transfer_type,
+                    travel_row[0], str(travel_row[1])
+                )
         except Exception:
             pass
 
@@ -281,33 +302,9 @@ class MoneyTransferSystem:
                     "error": ("Invalid recipient phone number. "
                               "Use 078, 079 (MTN) or 072, 073 (Tigo) format.")}
 
-        # ── 2b. Recipient travel block check ─────────────────────────────
-        try:
-            import datetime as _dt
-            _today = _dt.date.today().isoformat()
-            _conn = self.get_connection()
-            _c = _conn.cursor()
-            _c.execute("""
-                SELECT destination_country, return_date FROM travel_records
-                WHERE user_phone = %s
-                  AND date(departure_date) <= date(%s)
-                  AND date(return_date)    >= date(%s)
-                ORDER BY id DESC LIMIT 1
-            """, (recipient["phone"], _today, _today))
-            _rec_travel = _c.fetchone()
-            _conn.close()
-            if _rec_travel:
-                return {
-                    "success": False,
-                    "action": "BLOCK",
-                    "error": (
-                        f"✈️ This recipient is currently abroad in {_rec_travel[0]} "
-                        f"and cannot receive transfers until {_rec_travel[1]}. "
-                        f"Their SIM is blocked for travel security."
-                    )
-                }
-        except Exception:
-            pass
+        # ── 2b. Recipient travel check — allow receiving while abroad ────────
+        # Recipients can still receive money even if abroad; the sender-side
+        # flow (handled above) is what gates the transaction via email verify.
 
         # ── 3. Basic input validation (not a rule — just math) ─────────────
         if not isinstance(amount, (int, float)) or amount <= 0:
@@ -492,6 +489,192 @@ class MoneyTransferSystem:
             "fraud_score"  : fraud_score,
             "risk_level"   : risk_level,
             "face_verified": face_verified,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # ABROAD TRANSFER — save pending + email owner for face verify
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _handle_abroad_transfer(self, user: dict, recipient_phone: str,
+                                 amount: float, fee: float, transfer_type: str,
+                                 destination: str, return_date: str) -> dict:
+        """
+        Someone is trying to use a SIM whose owner is abroad.
+        Save the transfer as pending and email the owner a one-time face
+        verification link.  The owner approves (face match) or ignores
+        (transfer expires).
+        """
+        import secrets as _sec
+        from datetime import datetime as _dt, timedelta as _td
+
+        token = _sec.token_urlsafe(32)
+        expires_at = _dt.now() + _td(hours=24)
+
+        # Look up owner email
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT email, full_name FROM users WHERE id = %s", (user["id"],))
+        row = c.fetchone()
+        owner_email = row[0] if row else None
+        owner_name  = row[1] if row else "Account Owner"
+
+        # Save pending transfer
+        c.execute('''
+            INSERT INTO abroad_pending_transfers
+            (sender_id, recipient_phone, amount, fee, transfer_type,
+             network, verify_token, status, destination, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+        ''', (user["id"], recipient_phone, amount, fee, transfer_type,
+              self._validate_recipient(recipient_phone)["network"],
+              token, destination, expires_at))
+        conn.commit()
+        conn.close()
+
+        # Send email with verification link
+        verify_link = f"http://localhost:5173/abroad-verify?token={token}"
+        if owner_email:
+            try:
+                import smtplib
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
+
+                SMTP_HOST     = 'smtp.gmail.com'
+                SMTP_PORT     = 587
+                SMTP_USERNAME = 'ericuwinezastarboy@gmail.com'
+                SMTP_PASSWORD = 'wagbvbyowxhbwrsg'
+
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = '⚠️ MoMo Shield — Transfer Attempt on Your SIM'
+                msg['From']    = f'MoMo Shield <{SMTP_USERNAME}>'
+                msg['To']      = owner_email
+
+                html = f"""
+                <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:30px;
+                            border:1px solid #e2e8f0;border-radius:12px;">
+                  <h2 style="color:#f59e0b;">⚠️ Transfer Attempt While You Are Abroad</h2>
+                  <p>Hello <strong>{owner_name}</strong>,</p>
+                  <p>Someone just tried to make a transfer from your MoMo account while you are abroad
+                     in <strong>{destination}</strong>.</p>
+                  <table style="border-collapse:collapse;width:100%;margin:16px 0;">
+                    <tr><td style="padding:6px;color:#64748b;">Recipient</td>
+                        <td style="padding:6px;font-weight:bold;">{recipient_phone}</td></tr>
+                    <tr><td style="padding:6px;color:#64748b;">Amount</td>
+                        <td style="padding:6px;font-weight:bold;">{amount:,.0f} RWF</td></tr>
+                    <tr><td style="padding:6px;color:#64748b;">Fee</td>
+                        <td style="padding:6px;">{fee:,.0f} RWF</td></tr>
+                    <tr><td style="padding:6px;color:#64748b;">Total</td>
+                        <td style="padding:6px;font-weight:bold;color:#10b981;">{(amount+fee):,.0f} RWF</td></tr>
+                  </table>
+                  <p>If <strong>you authorised this</strong>, click the button below and scan your face
+                     to approve it. The link expires in <strong>24 hours</strong>.</p>
+                  <a href="{verify_link}"
+                     style="display:inline-block;margin:20px 0;padding:14px 32px;
+                            background:linear-gradient(to right,#10b981,#0ea5e9);
+                            color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;">
+                    ✅ Approve Transfer with Face Scan
+                  </a>
+                  <p style="color:#ef4444;font-weight:bold;">
+                    If you did NOT authorise this transfer, do NOT click the link.
+                    The transfer will be automatically rejected after 24 hours.
+                  </p>
+                  <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0;">
+                  <p style="color:#94a3b8;font-size:11px;">
+                    MoMo Shield — AI-Powered Mobile Money Fraud Detection
+                  </p>
+                </div>
+                """
+                msg.attach(MIMEText(html, 'html'))
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                    server.ehlo(); server.starttls()
+                    server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                    server.sendmail(SMTP_USERNAME, owner_email, msg.as_string())
+                print(f"[AbroadTransfer] Verification email sent to {owner_email}")
+            except Exception as e:
+                print(f"[AbroadTransfer] Email send failed: {e}")
+
+        return {
+            "success"      : False,
+            "action"       : "ABROAD_PENDING",
+            "abroad_pending": True,
+            "message"      : (
+                f"✈️ This SIM is registered as abroad in {destination}. "
+                f"A verification email has been sent to the account owner at "
+                f"{owner_email[:3]}***{owner_email[owner_email.index('@'):] if owner_email and '@' in owner_email else ''}. "
+                f"The transfer of {amount:,.0f} RWF will be processed once the owner "
+                f"approves it via face scan. Link expires in 24 hours."
+            ),
+            "owner_email_hint": (
+                f"{owner_email[:3]}***{owner_email[owner_email.index('@'):]}"
+                if owner_email and '@' in owner_email else "owner email"
+            ),
+        }
+
+    def complete_abroad_transfer(self, token: str) -> dict:
+        """
+        Called after the abroad owner completes face verification.
+        Executes the pending transfer: deduct sender balance, credit recipient.
+        """
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, sender_id, recipient_phone, amount, fee,
+                   transfer_type, network, destination, expires_at
+            FROM abroad_pending_transfers
+            WHERE verify_token = %s AND status = 'pending'
+        ''', (token,))
+        row = c.fetchone()
+
+        if not row:
+            conn.close()
+            return {"success": False, "error": "Verification link is invalid or already used."}
+
+        pid, sender_id, recipient_phone, amount, fee, \
+            transfer_type, network, destination, expires_at = row
+
+        from datetime import datetime as _dt
+        if _dt.now() > expires_at:
+            c.execute("UPDATE abroad_pending_transfers SET status='expired' WHERE id=%s", (pid,))
+            conn.commit(); conn.close()
+            return {"success": False, "error": "This verification link has expired."}
+
+        total = amount + fee
+
+        # Check sender still has enough balance
+        c.execute("SELECT account_balance FROM users WHERE id=%s", (sender_id,))
+        bal_row = c.fetchone()
+        if not bal_row or bal_row[0] < total:
+            c.execute("UPDATE abroad_pending_transfers SET status='failed' WHERE id=%s", (pid,))
+            conn.commit(); conn.close()
+            return {"success": False,
+                    "error": f"Insufficient balance. Required {total:,.0f} RWF."}
+
+        # Execute transfer
+        reference = self._generate_reference()
+        c.execute("UPDATE users SET account_balance = account_balance - %s WHERE id = %s",
+                  (total, sender_id))
+        c.execute("UPDATE users SET account_balance = account_balance + %s WHERE phone_number = %s AND is_active=TRUE",
+                  (amount, recipient_phone))
+        c.execute("UPDATE abroad_pending_transfers SET status='completed' WHERE id=%s", (pid,))
+        conn.commit()
+        conn.close()
+
+        self._record_transfer(
+            sender_id=sender_id, recipient_phone=recipient_phone,
+            amount=amount, transfer_type=transfer_type, network=network,
+            reference=reference, status="completed",
+            fraud_score=0.1, ml_score=0.1, rule_score=0.0,
+            risk_level="LOW", is_fraud=False, face_verified=True,
+            fee=fee,
+            notes=f"Abroad owner face-verified transfer. Destination: {destination}."
+        )
+
+        return {
+            "success"  : True,
+            "message"  : f"Transfer of {amount:,.0f} RWF to {recipient_phone} approved and completed.",
+            "reference": reference,
+            "amount"   : amount,
+            "fee"      : fee,
+            "total"    : total,
         }
 
     # ─────────────────────────────────────────────────────────────────────

@@ -1414,19 +1414,10 @@ class RealTimeFraudDetector:
         checks["balance_multiplier"] = {"passed": True, "msg": "Delegated to ML model"}
 
         # ── 3. Travel check ───────────────────────────────────────────────
-        if self.travel_sys.is_user_abroad(phone_number):
-            checks["travel"] = {"passed": False,
-                                 "msg": "User is registered as abroad — transfers blocked."}
-            result.update({"action": "BLOCK", "risk_level": "HIGH",
-                           "message": "Transaction blocked: your SIM is deactivated for "
-                                      "international travel. Please contact your service "
-                                      "provider when you return."})
-            self.alert_sys.raise_alert(
-                phone_number, amount, 1.0, "HIGH", "BLOCK",
-                "Attempted transfer while registered abroad.")
-            result["alert"] = True
-            return result
-        checks["travel"] = {"passed": True, "msg": "User is in country"}
+        # Travel blocking is now handled in money_transfer.py before this
+        # function is called (abroad users go through email face-verify flow).
+        # No hard block here.
+        checks["travel"] = {"passed": True, "msg": "Travel handled upstream"}
 
         # ── 4. Log transaction to history (needed for ML feature building) ──
         #   record_transaction() writes to transaction_history so that
